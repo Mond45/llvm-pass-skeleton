@@ -1,56 +1,62 @@
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Transforms/Utils/ModuleUtils.h"
-#include <llvm/IR/Analysis.h>
-#include <llvm/IR/DerivedTypes.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/LLVMContext.h>
+#include <llvm/ADT/SetVector.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstrTypes.h>
+#include <llvm/IR/Instruction.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/Support/Casting.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Scalar/LoopPassManager.h>
+#include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/Utils/LoopUtils.h>
+#include <llvm/Transforms/Utils/Mem2Reg.h>
 
 using namespace llvm;
 
 namespace {
 
-struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
-    LLVMContext &ctx = M.getContext();
-
-    Type *void_type = Type::getVoidTy(ctx);
-
-    if (M.getName() == "rt.cpp")
-      return PreservedAnalyses::all();
-
-    if (Function *f = M.getFunction("main"); f && !f->isDeclaration()) {
-      FunctionType *summary_fn_type = FunctionType::get(void_type, false);
-      auto summary_fn =
-          M.getOrInsertFunction("__instrumentor_summary", summary_fn_type);
-      Function *p_summary_fn = cast<Function>(summary_fn.getCallee());
-      appendToGlobalDtors(M, p_summary_fn, 0);
+struct LICMPass : public PassInfoMixin<LICMPass> {
+  PreservedAnalyses run(Loop &L, LoopAnalysisManager &LAM,
+                        LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+    // get the loop preheader or insert one
+    auto preheader = L.getLoopPreheader();
+    if (!preheader) {
+      preheader = InsertPreheaderForLoop(&L, &AR.DT, &AR.LI, nullptr, false);
     }
 
-    for (auto &F : M) {
-      // errs() << "I saw a function called " << F.getName() << "!\n";
-      if (F.isDeclaration())
-        continue;
+    SetVector<Value *> loop_invariants;
 
-      auto &entry_block = F.getEntryBlock();
-      auto insert_iter = entry_block.getFirstInsertionPt();
-      IRBuilder<> builder(&entry_block);
-      builder.SetInsertPoint(&entry_block, insert_iter);
+    bool changing = true;
+    while (changing) {
+      size_t initial_size = loop_invariants.size();
 
-      Type *char_type = Type::getInt8Ty(ctx);
-      PointerType *c_str_type = PointerType::get(char_type, 0);
-      FunctionType *instrument_fn_type =
-          FunctionType::get(void_type, {c_str_type}, false);
-      auto instrument_fn =
-          M.getOrInsertFunction("__instrumentor_incr_cnt", instrument_fn_type);
+      for (auto *B : L.blocks()) {
+        for (auto &I : *B) {
+          if (all_of(I.operands(),
+                     [&](Value *v) {
+                       return L.isLoopInvariant(v) ||
+                              loop_invariants.contains(v);
+                     }) &&
+              isSafeToSpeculativelyExecute(&I) && !I.mayReadFromMemory() &&
+              !I.isEHPad()) {
+            loop_invariants.insert(&I);
+          }
+        }
+      }
 
-      auto fn_name = builder.CreateGlobalString(F.getName());
-      builder.CreateCall(instrument_fn, {fn_name});
+      changing = loop_invariants.size() != initial_size;
     }
-    return PreservedAnalyses::all();
-  };
+
+    for (auto V : loop_invariants) {
+      Instruction *I = cast<Instruction>(V);
+      I->moveBefore(preheader->getTerminator());
+    }
+
+    return PreservedAnalyses::none();
+  }
+  static bool isRequired() { return true; }
 };
 
 } // namespace
@@ -58,12 +64,15 @@ struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {.APIVersion = LLVM_PLUGIN_API_VERSION,
-          .PluginName = "Skeleton pass",
+          .PluginName = "LICM pass",
           .PluginVersion = "v0.1",
           .RegisterPassBuilderCallbacks = [](PassBuilder &PB) {
-            PB.registerPipelineStartEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel Level) {
-                  MPM.addPass(SkeletonPass());
-                });
+            PB.registerPipelineStartEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel Level) {
+              FunctionPassManager FPM;
+              FPM.addPass(PromotePass());
+              FPM.addPass(createFunctionToLoopPassAdaptor(LICMPass()));
+              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+            });
           }};
 }
